@@ -188,7 +188,7 @@ DEFAULT_CONFIG = {
     "menu_bar_station": 0,
     "menu_bar_format": "compact",
     "show_alerts": True,
-    "max_departures": 4,
+    "max_departures": 3,
 }
 
 
@@ -269,18 +269,22 @@ def fetch_alerts_pb(timeout=10):
 
 # ── Data parsing ─────────────────────────────────────────────────────────────
 
-def parse_departures(feed, target_stop_id, route_filter=None, max_results=6):
+def parse_station_board(feed, target_stop_id, route_filter=None, max_per_dir=3):
     """
-    Extract upcoming departures for a stop from a TripUpdates feed.
+    Build a departure-board view for a station from GTFS-RT TripUpdates.
 
-    Returns sorted list:
+    Returns dict with two sorted lists:
+      { "departing": [...], "arriving": [...] }
+
+    Each entry:
       { train, route, route_short, direction, stop_id,
-        scheduled, delay_sec, estimated, headsign }
+        time, delay_sec, estimated, destination, origin, is_terminus }
     """
     if feed is None:
-        return []
+        return {"departing": [], "arriving": []}
 
-    results = []
+    departing = []
+    arriving = []
     now = datetime.now()
     target = str(target_stop_id)
 
@@ -294,55 +298,80 @@ def parse_departures(feed, target_stop_id, route_filter=None, max_results=6):
             continue
 
         train = tu.vehicle.label or tu.trip.trip_id or "?"
-        direction = tu.trip.direction_id  # 0=inbound, 1=outbound
+        direction = tu.trip.direction_id
         global_delay = tu.delay or 0
+        stops = tu.stop_time_update
 
-        # Determine headsign: terminal station for this trip.
-        # The stop_time_update list is ordered by stop_sequence.
-        # The last entry is the final destination.
-        headsign = ""
-        if tu.stop_time_update:
-            terminal_id = str(tu.stop_time_update[-1].stop_id)
-            terminal_name = STOP_NAMES.get(terminal_id, terminal_id)
-            # If the terminal IS our target stop, use the first stop instead
-            # (we're at the end of the line — show where it came from)
-            if terminal_id == str(target_stop_id):
-                origin_id = str(tu.stop_time_update[0].stop_id)
-                headsign = f"from {STOP_NAMES.get(origin_id, origin_id)}"
-            else:
-                headsign = terminal_name
+        if not stops:
+            continue
 
-        for stu in tu.stop_time_update:
-            if str(stu.stop_id) != target:
-                continue
+        # Find our stop in the sequence
+        target_idx = None
+        for idx, stu in enumerate(stops):
+            if str(stu.stop_id) == target:
+                target_idx = idx
+                break
 
-            dep = stu.departure if stu.departure.time else stu.arrival
-            if not dep.time:
-                continue
+        if target_idx is None:
+            continue
 
-            delay_sec = dep.delay or global_delay
-            estimated = datetime.fromtimestamp(dep.time)
-            scheduled = datetime.fromtimestamp(dep.time - delay_sec)
+        stu = stops[target_idx]
+        is_first = (target_idx == 0)
+        is_last = (target_idx == len(stops) - 1)
 
-            # Skip departed (2 min grace)
-            if estimated < now - timedelta(minutes=2):
-                continue
+        # Terminal station names
+        origin_id = str(stops[0].stop_id)
+        terminal_id = str(stops[-1].stop_id)
+        origin_name = STOP_NAMES.get(origin_id, origin_id)
+        terminal_name = STOP_NAMES.get(terminal_id, terminal_id)
 
-            results.append({
-                "train": train,
-                "route": route,
-                "route_short": ROUTE_SHORT.get(route, route[:4]),
-                "direction": direction,
-                "stop_id": target,
-                "scheduled": scheduled,
-                "delay_sec": delay_sec,
-                "estimated": estimated,
-                "headsign": headsign,
-            })
-            break  # One match per trip
+        # Get arrival and departure times at this stop
+        arr_time = stu.arrival.time if stu.arrival.time else 0
+        dep_time = stu.departure.time if stu.departure.time else 0
+        arr_delay = stu.arrival.delay if stu.arrival.time else global_delay
+        dep_delay = stu.departure.delay if stu.departure.time else global_delay
 
-    results.sort(key=lambda d: d["estimated"])
-    return results[:max_results]
+        base = {
+            "train": train,
+            "route": route,
+            "route_short": ROUTE_SHORT.get(route, route[:4]),
+            "direction": direction,
+            "stop_id": target,
+        }
+
+        # Departing: train leaves this station (not the last stop)
+        if not is_last and dep_time:
+            est = datetime.fromtimestamp(dep_time)
+            if est >= now - timedelta(minutes=2):
+                departing.append({
+                    **base,
+                    "estimated": est,
+                    "delay_sec": dep_delay,
+                    "destination": terminal_name,
+                    "origin": origin_name,
+                    "is_terminus": False,
+                })
+
+        # Arriving: train arrives at this station (not the first stop)
+        if not is_first and arr_time:
+            est = datetime.fromtimestamp(arr_time)
+            if est >= now - timedelta(minutes=2):
+                arriving.append({
+                    **base,
+                    "estimated": est,
+                    "delay_sec": arr_delay,
+                    "destination": terminal_name,
+                    "origin": origin_name,
+                    "is_terminus": is_last,
+                })
+
+    departing.sort(key=lambda d: d["estimated"])
+    arriving.sort(key=lambda d: d["estimated"])
+
+    return {
+        "departing": departing[:max_per_dir],
+        "arriving": arriving[:max_per_dir],
+    }
 
 
 def parse_alerts(feed, route_filter=None):
@@ -494,8 +523,8 @@ class MetrolinkStatus(rumps.App):
     # ── Menu construction ────────────────────────────────────────────────
 
     def _build_menu(self):
-        # Each station: header (clickable) + single info line
-        self.dep_lines = []  # one MenuItem per station for departure info
+        rows_per_station = self.max_deps
+        self.dep_rows = []
 
         for i, st in enumerate(self.stations):
             name = st["name"]
@@ -504,16 +533,23 @@ class MetrolinkStatus(rumps.App):
             self.station_headers.append(hdr)
             self.menu.add(hdr)
 
-            info = rumps.MenuItem("  loading...")
-            self.dep_lines.append(info)
-            self.menu.add(info)
+            rows = []
+            for j in range(rows_per_station):
+                mi = rumps.MenuItem("  loading..." if j == 0 else " ")
+                rows.append(mi)
+                self.menu.add(mi)
+            self.dep_rows.append(rows)
             self.menu.add(None)
 
         if self.show_alerts_cfg:
             self.alerts_hdr = rumps.MenuItem("No alerts")
             self.menu.add(self.alerts_hdr)
-            self.alert_line = rumps.MenuItem("")
-            self.menu.add(self.alert_line)
+            self.alert_lines = []
+            for j in range(3):
+                mi = rumps.MenuItem("")
+                mi.set_callback(self._mk_alert_cb(j))
+                self.alert_lines.append(mi)
+                self.menu.add(mi)
             self.menu.add(None)
 
         self.status_mi = rumps.MenuItem("Updated: --")
@@ -602,7 +638,6 @@ class MetrolinkStatus(rumps.App):
         else:
             log("Feed returned None")
 
-        # Collect all routes across stations for alert filtering
         all_routes = set()
 
         for i, st in enumerate(self.stations):
@@ -611,10 +646,8 @@ class MetrolinkStatus(rumps.App):
             if route_filter:
                 all_routes.update(route_filter)
 
-            deps = parse_departures(
-                feed, stop_id, route_filter, self.max_deps
-            )
-            self.station_data[st["name"]] = deps
+            board = parse_station_board(feed, stop_id, route_filter, self.max_deps)
+            self.station_data[st["name"]] = board
 
         if self.show_alerts_cfg:
             afeed = fetch_alerts_pb()
@@ -629,59 +662,61 @@ class MetrolinkStatus(rumps.App):
     # ── Display updates ──────────────────────────────────────────────────
 
     def _update_menu(self):
-        for i, st in enumerate(self.stations):
-            deps = self.station_data.get(st["name"], [])
-            info = self.dep_lines[i]
+        n_rows = self.max_deps
 
-            if not deps:
-                info.title = "  No upcoming departures"
-            elif len(deps) == 1:
-                d = deps[0]
-                sc = status_char(d["delay_sec"])
-                rs = d["route_short"]
-                tr = d["train"]
-                et = fmt_time(d["estimated"])
-                mn = fmt_mins(d["estimated"])
-                dl = delay_label(d["delay_sec"])
-                hs = d["headsign"]
-                line = f"  {sc} {rs} {tr}  {et} ({mn})"
-                if dl:
-                    line += f"  {dl}"
-                if hs:
-                    line += f"  \u2014 {hs}"
-                info.title = line
-            else:
-                # Multiple departures: show first, then compact list of rest
-                parts = []
-                for d in deps:
+        for i, st in enumerate(self.stations):
+            board = self.station_data.get(st["name"], {"departing": [], "arriving": []})
+
+            # Departures first, fill remaining with arrivals
+            dep_typed = [({**d, "_type": "dep"}) for d in board.get("departing", [])]
+            arr_typed = [({**d, "_type": "arr"}) for d in board.get("arriving", [])]
+            n_dep = min(len(dep_typed), n_rows - 1) if arr_typed else min(len(dep_typed), n_rows)
+            n_arr = min(len(arr_typed), n_rows - n_dep)
+            combined = dep_typed[:n_dep] + arr_typed[:n_arr]
+
+            rows = self.dep_rows[i]
+            for j, mi in enumerate(rows):
+                if j < len(combined):
+                    d = combined[j]
                     sc = status_char(d["delay_sec"])
                     rs = d["route_short"]
                     tr = d["train"]
                     et = fmt_time(d["estimated"])
                     mn = fmt_mins(d["estimated"])
                     dl = delay_label(d["delay_sec"])
-                    hs = d["headsign"]
-                    line = f"{sc} {rs} {tr} {et} ({mn})"
-                    if dl:
-                        line += f" {dl}"
-                    if hs:
-                        line += f" \u2014 {hs}"
-                    parts.append(line)
-                info.title = "  " + "  |  ".join(parts)
+
+                    if d["_type"] == "dep":
+                        line = f"  {sc} {rs} {tr}  {et} ({mn})"
+                        if dl:
+                            line += f"  {dl}"
+                        line += f"  \u2192 {d['destination']}"
+                    else:
+                        line = f"  {sc} {rs} {tr}  {et} ({mn})"
+                        if dl:
+                            line += f"  {dl}"
+                        line += f"  \u2190 {d['origin']}"
+                    mi.title = line
+                elif j == 0 and not combined:
+                    mi.title = "  No upcoming trains"
+                else:
+                    mi.title = " "
 
         if self.show_alerts_cfg:
             if not self.alert_data:
                 self.alerts_hdr.title = "No alerts"
-                self.alert_line.title = ""
+                for mi in self.alert_lines:
+                    mi.title = ""
             else:
                 n = len(self.alert_data)
                 self.alerts_hdr.title = f"Alerts ({n})"
-                # Show first alert header, clickable
-                h = self.alert_data[0]["header"]
-                if len(h) > 80:
-                    h = h[:77] + "..."
-                self.alert_line.title = f"  {h}"
-                self.alert_line.set_callback(self._mk_alert_cb(0))
+                for j, mi in enumerate(self.alert_lines):
+                    if j < len(self.alert_data):
+                        h = self.alert_data[j]["header"]
+                        if len(h) > 80:
+                            h = h[:77] + "..."
+                        mi.title = f"  {h}"
+                    else:
+                        mi.title = ""
 
         if self.last_update:
             self.status_mi.title = f"Updated {fmt_time(self.last_update)}"
@@ -690,18 +725,21 @@ class MetrolinkStatus(rumps.App):
         if self.is_sleeping or self.is_paused:
             return
 
-        if self.mb_idx >= len(self.stations):
+        # Find next departure: try selected station first, then cascade
+        d = None
+        for attempt in range(len(self.stations)):
+            idx = (self.mb_idx + attempt) % len(self.stations)
+            name = self.stations[idx]["name"]
+            board = self.station_data.get(name, {"departing": [], "arriving": []})
+            deps = board.get("departing", [])
+            if deps:
+                d = deps[0]
+                break
+
+        if not d:
             self.title = "--"
             return
 
-        name = self.stations[self.mb_idx]["name"]
-        deps = self.station_data.get(name, [])
-
-        if not deps:
-            self.title = "--"
-            return
-
-        d = deps[0]
         mn = fmt_mins(d["estimated"])
         dl = delay_dots(d["delay_sec"])
 
