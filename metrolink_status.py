@@ -485,9 +485,7 @@ class MetrolinkStatus(rumps.App):
         self.is_sleeping = False
         self.is_paused = False
 
-        # Direct references to menu items
-        self.dep_items = []
-        self.alert_items = []
+        # Direct references to station header menu items
         self.station_headers = []
 
         self._build_menu()
@@ -496,6 +494,9 @@ class MetrolinkStatus(rumps.App):
     # ── Menu construction ────────────────────────────────────────────────
 
     def _build_menu(self):
+        # Each station: header (clickable) + single info line
+        self.dep_lines = []  # one MenuItem per station for departure info
+
         for i, st in enumerate(self.stations):
             name = st["name"]
             hdr = rumps.MenuItem(name, callback=self._mk_station_cb(i))
@@ -503,22 +504,16 @@ class MetrolinkStatus(rumps.App):
             self.station_headers.append(hdr)
             self.menu.add(hdr)
 
-            items = []
-            for j in range(self.max_deps):
-                mi = rumps.MenuItem("  loading..." if j == 0 else "")
-                items.append(mi)
-                self.menu.add(mi)
-            self.dep_items.append(items)
+            info = rumps.MenuItem("  loading...")
+            self.dep_lines.append(info)
+            self.menu.add(info)
             self.menu.add(None)
 
         if self.show_alerts_cfg:
-            self.alerts_hdr = rumps.MenuItem("Alerts")
+            self.alerts_hdr = rumps.MenuItem("No alerts")
             self.menu.add(self.alerts_hdr)
-            self.alert_items = []
-            for _ in range(4):
-                mi = rumps.MenuItem("")
-                self.alert_items.append(mi)
-                self.menu.add(mi)
+            self.alert_line = rumps.MenuItem("")
+            self.menu.add(self.alert_line)
             self.menu.add(None)
 
         self.status_mi = rumps.MenuItem("Updated: --")
@@ -636,9 +631,29 @@ class MetrolinkStatus(rumps.App):
     def _update_menu(self):
         for i, st in enumerate(self.stations):
             deps = self.station_data.get(st["name"], [])
-            for j, mi in enumerate(self.dep_items[i]):
-                if j < len(deps):
-                    d = deps[j]
+            info = self.dep_lines[i]
+
+            if not deps:
+                info.title = "  No upcoming departures"
+            elif len(deps) == 1:
+                d = deps[0]
+                sc = status_char(d["delay_sec"])
+                rs = d["route_short"]
+                tr = d["train"]
+                et = fmt_time(d["estimated"])
+                mn = fmt_mins(d["estimated"])
+                dl = delay_label(d["delay_sec"])
+                hs = d["headsign"]
+                line = f"  {sc} {rs} {tr}  {et} ({mn})"
+                if dl:
+                    line += f"  {dl}"
+                if hs:
+                    line += f"  \u2014 {hs}"
+                info.title = line
+            else:
+                # Multiple departures: show first, then compact list of rest
+                parts = []
+                for d in deps:
                     sc = status_char(d["delay_sec"])
                     rs = d["route_short"]
                     tr = d["train"]
@@ -646,33 +661,27 @@ class MetrolinkStatus(rumps.App):
                     mn = fmt_mins(d["estimated"])
                     dl = delay_label(d["delay_sec"])
                     hs = d["headsign"]
-
-                    line = f"  {sc} {rs} {tr}  {et} ({mn})"
+                    line = f"{sc} {rs} {tr} {et} ({mn})"
                     if dl:
-                        line += f"  {dl}"
+                        line += f" {dl}"
                     if hs:
-                        line += f"  \u2014 {hs}"  # em dash
-                    mi.title = line
-                elif j == 0 and not deps:
-                    mi.title = "  No upcoming departures"
-                else:
-                    # Hide unused slots by making them a single space
-                    # (rumps still renders empty-string items as blank rows)
-                    mi.title = " "
+                        line += f" \u2014 {hs}"
+                    parts.append(line)
+                info.title = "  " + "  |  ".join(parts)
 
         if self.show_alerts_cfg:
-            for j, mi in enumerate(self.alert_items):
-                if j < len(self.alert_data):
-                    h = self.alert_data[j]["header"]
-                    # Truncate for menu readability
-                    if len(h) > 70:
-                        h = h[:67] + "..."
-                    mi.title = f"  {h}" if h else ""
-                else:
-                    mi.title = ""
-
-            n = len(self.alert_data)
-            self.alerts_hdr.title = f"Alerts ({n})" if n else "No alerts"
+            if not self.alert_data:
+                self.alerts_hdr.title = "No alerts"
+                self.alert_line.title = ""
+            else:
+                n = len(self.alert_data)
+                self.alerts_hdr.title = f"Alerts ({n})"
+                # Show first alert header, clickable
+                h = self.alert_data[0]["header"]
+                if len(h) > 80:
+                    h = h[:77] + "..."
+                self.alert_line.title = f"  {h}"
+                self.alert_line.set_callback(self._mk_alert_cb(0))
 
         if self.last_update:
             self.status_mi.title = f"Updated {fmt_time(self.last_update)}"
@@ -704,6 +713,34 @@ class MetrolinkStatus(rumps.App):
             self.title = f"{mn}{dl}"
 
     # ── Actions ──────────────────────────────────────────────────────────
+
+    def _mk_alert_cb(self, idx):
+        """Click an alert to see the full text and open the URL if available."""
+        def cb(_):
+            if idx < len(self.alert_data):
+                alert = self.alert_data[idx]
+                url = alert.get("url", "")
+                desc = alert.get("description", "")
+                header = alert.get("header", "")
+
+                # Show full alert text as a macOS notification
+                body = desc if desc else header
+                if body:
+                    rumps.notification(
+                        title="Metrolink Alert",
+                        subtitle=header[:80] if desc else "",
+                        message=body[:300],
+                    )
+
+                # Open URL if provided, otherwise alerts page
+                if url:
+                    subprocess.run(["open", url])
+                else:
+                    subprocess.run([
+                        "open",
+                        "https://metrolinktrains.com/train_status/alerts/",
+                    ])
+        return cb
 
     def _toggle(self, _):
         self.is_paused = not self.is_paused
