@@ -15,13 +15,27 @@ Config:  ~/.config/metrolink_status/config.json  (auto-created on first run)
 Logs:    ~/.config/metrolink_status/metrolink_status.log
 """
 
+import os
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+
 import json
 import logging
 import subprocess
 import sys
 import threading
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Suppress LibreSSL/urllib3 warnings on macOS system Python
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*LibreSSL.*")
+warnings.filterwarnings("ignore", message=".*NotOpenSSL.*")
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 
 try:
     import rumps
@@ -158,14 +172,23 @@ DEFAULT_CONFIG = {
     ],
     "poll_interval_seconds": 120,
     "active_hours": {
-        "morning": {"start": "05:00", "end": "10:30"},
-        "evening": {"start": "14:00", "end": "20:30"},
+        "morning": {
+            "start": "05:00",
+            "end": "10:30",
+            "show_station": 0,
+        },
+        "evening": {
+            "start": "14:00",
+            "end": "20:30",
+            "show_station": 1,
+        },
     },
+    "skip_days": [4],
     "always_active": False,
     "menu_bar_station": 0,
     "menu_bar_format": "compact",
     "show_alerts": True,
-    "max_departures": 6,
+    "max_departures": 4,
 }
 
 
@@ -274,11 +297,20 @@ def parse_departures(feed, target_stop_id, route_filter=None, max_results=6):
         direction = tu.trip.direction_id  # 0=inbound, 1=outbound
         global_delay = tu.delay or 0
 
-        # Determine headsign from last stop in the sequence
+        # Determine headsign: terminal station for this trip.
+        # The stop_time_update list is ordered by stop_sequence.
+        # The last entry is the final destination.
         headsign = ""
         if tu.stop_time_update:
-            last_stop_id = str(tu.stop_time_update[-1].stop_id)
-            headsign = STOP_NAMES.get(last_stop_id, last_stop_id)
+            terminal_id = str(tu.stop_time_update[-1].stop_id)
+            terminal_name = STOP_NAMES.get(terminal_id, terminal_id)
+            # If the terminal IS our target stop, use the first stop instead
+            # (we're at the end of the line — show where it came from)
+            if terminal_id == str(target_stop_id):
+                origin_id = str(tu.stop_time_update[0].stop_id)
+                headsign = f"from {STOP_NAMES.get(origin_id, origin_id)}"
+            else:
+                headsign = terminal_name
 
         for stu in tu.stop_time_update:
             if str(stu.stop_id) != target:
@@ -348,18 +380,22 @@ def parse_alerts(feed, route_filter=None):
 
 # ── Time / display helpers ───────────────────────────────────────────────────
 
-def is_active(hours, always=False):
+def active_window(hours, always=False):
+    """
+    Returns (is_active, window_name, window_config) tuple.
+    window_name is the key like "morning" or "evening", or None.
+    """
     if always:
-        return True
+        return True, None, None
     now = datetime.now()
-    for _, w in hours.items():
+    for name, w in hours.items():
         sh, sm = map(int, w["start"].split(":"))
         eh, em = map(int, w["end"].split(":"))
         s = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
         e = now.replace(hour=eh, minute=em, second=0, microsecond=0)
         if s <= now <= e:
-            return True
-    return False
+            return True, name, w
+    return False, None, None
 
 
 def fmt_mins(dt):
@@ -437,10 +473,11 @@ class MetrolinkStatus(rumps.App):
         self.poll_interval = self.config.get("poll_interval_seconds", 120)
         self.active_hours = self.config.get("active_hours", {})
         self.always_on = self.config.get("always_active", False)
+        self.skip_days = self.config.get("skip_days", [])  # 0=Mon .. 6=Sun
         self.mb_idx = self.config.get("menu_bar_station", 0)
         self.mb_fmt = self.config.get("menu_bar_format", "compact")
         self.show_alerts_cfg = self.config.get("show_alerts", True)
-        self.max_deps = self.config.get("max_departures", 6)
+        self.max_deps = self.config.get("max_departures", 4)
 
         self.station_data = {}
         self.alert_data = []
@@ -520,7 +557,21 @@ class MetrolinkStatus(rumps.App):
         if self.is_paused:
             return
 
-        if not is_active(self.active_hours, self.always_on):
+        # Skip configured days (e.g. Friday = 4)
+        today = datetime.now().weekday()  # 0=Mon
+        if today in self.skip_days and not self.always_on:
+            if not self.is_sleeping:
+                self.is_sleeping = True
+                self.title = "--"
+                self.sched_mi.title = "Off today"
+                log(f"Skipping day {today}")
+            return
+
+        on, window_name, window_cfg = active_window(
+            self.active_hours, self.always_on
+        )
+
+        if not on:
             if not self.is_sleeping:
                 self.is_sleeping = True
                 self.title = "--"
@@ -533,6 +584,15 @@ class MetrolinkStatus(rumps.App):
             self.sched_mi.title = ""
             self._elapsed = self.poll_interval
             log("Waking")
+
+        # Auto-switch menu bar station based on active window
+        if window_cfg and "show_station" in window_cfg:
+            new_idx = window_cfg["show_station"]
+            if new_idx != self.mb_idx and new_idx < len(self.stations):
+                self.mb_idx = new_idx
+                for i, h in enumerate(self.station_headers):
+                    h.state = (i == new_idx)
+                log(f"Auto-switched to {self.stations[new_idx]['name']}")
 
         self._elapsed += 30
         if self._elapsed >= self.poll_interval:
@@ -587,17 +647,18 @@ class MetrolinkStatus(rumps.App):
                     dl = delay_label(d["delay_sec"])
                     hs = d["headsign"]
 
-                    # Format: "  . AV 227  3:33p (12m)  > Lancaster"
                     line = f"  {sc} {rs} {tr}  {et} ({mn})"
                     if dl:
                         line += f"  {dl}"
                     if hs:
-                        line += f"  > {hs}"
+                        line += f"  \u2014 {hs}"  # em dash
                     mi.title = line
                 elif j == 0 and not deps:
                     mi.title = "  No upcoming departures"
                 else:
-                    mi.title = ""
+                    # Hide unused slots by making them a single space
+                    # (rumps still renders empty-string items as blank rows)
+                    mi.title = " "
 
         if self.show_alerts_cfg:
             for j, mi in enumerate(self.alert_items):

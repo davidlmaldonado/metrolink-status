@@ -50,14 +50,15 @@ On first run, the app creates a config file and tells you an API key is needed. 
   ],
   "poll_interval_seconds": 120,
   "active_hours": {
-    "morning": {"start": "05:00", "end": "10:30"},
-    "evening": {"start": "14:00", "end": "20:30"}
+    "morning": {"start": "05:00", "end": "10:30", "show_station": 0},
+    "evening": {"start": "14:00", "end": "20:30", "show_station": 1}
   },
+  "skip_days": [4],
   "always_active": false,
   "menu_bar_station": 0,
   "menu_bar_format": "compact",
   "show_alerts": true,
-  "max_departures": 6
+  "max_departures": 4
 }
 ```
 
@@ -69,7 +70,9 @@ On first run, the app creates a config file and tells you an API key is needed. 
 | `stations[].stop_id` | Numeric stop ID from Metrolink GTFS (see table below) |
 | `stations[].routes` | Filter to these route names, or `[]` for all |
 | `poll_interval_seconds` | How often to poll the feed (default 120, minimum 30) |
-| `always_active` | Set `true` to poll all day |
+| `active_hours.*.show_station` | Auto-switch menu bar to this station index during this window |
+| `skip_days` | Days to skip polling. `0`=Mon, `4`=Fri, `5`=Sat, `6`=Sun |
+| `always_active` | Set `true` to poll all day, every day |
 | `menu_bar_format` | `"compact"` = `12m`, `"full"` = `AV227 12m` |
 
 ### Menu bar format
@@ -159,6 +162,11 @@ cat > ~/Library/LaunchAgents/com.metrolink-status.plist << 'EOF'
         <string>/usr/local/bin/python3</string>
         <string>SCRIPT_PATH/metrolink_status.py</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONWARNINGS</key>
+        <string>ignore</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
