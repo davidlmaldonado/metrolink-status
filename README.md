@@ -1,24 +1,27 @@
 # Metrolink Status
 
-Real-time Metrolink train departures and service alerts in your macOS menu bar. Glance at the menu bar, know when the next train leaves.
+Real-time Metrolink train departures and service alerts in your macOS menu bar. Glance up, know when the next train leaves.
 
 ![Metrolink Status screenshot](images/menu-bar.png)
 
 ## What it does
 
-- Shows countdown to next departure at your selected station
-- Delay severity in the menu bar — `12m` on time, `12m *` minor, `12m **` moderate, `12m ***` severe
-- Dropdown shows full departure board with train numbers, times, and destinations
-- Service alerts from Metrolink (no API key needed for alerts)
-- Schedule-aware — only polls during your commute windows, sleeps otherwise
-- Click a station name to switch which one drives the menu bar display
-- Monochrome menu bar style that blends with native macOS
+- Countdown to next departure in the menu bar — no app to open
+- Departure board per station: trains leaving (`→`) and arriving (`←`) with destinations and origins
+- Departures prioritized over arrivals so you always see what's useful
+- Smart fallback — if your selected station has no upcoming departures, the menu bar shows the next departure from any configured station
+- Delay severity indicators: `*` minor, `**` moderate, `***` severe
+- Clickable service alerts with macOS notifications for full text
+- Auto-switches station by time of day (morning = origin, evening = return)
+- Skip days — no polling on Fridays, weekends, or whatever you configure
+- Schedule-aware — only polls during commute windows, sleeps otherwise
+- Monochrome menu bar that blends with native macOS
 
 ## Requirements
 
 - macOS 10.14+
 - Python 3.8+
-- Metrolink GTFS-RT API key (free): [Request one here](https://metrolinktrains.com/about/gtfs/gtfs-rt-access/)
+- Metrolink GTFS-RT API key (free): [request one here](https://metrolinktrains.com/about/gtfs/gtfs-rt-access/)
 
 ## Quick start
 
@@ -27,7 +30,7 @@ pip install rumps requests gtfs-realtime-bindings protobuf
 python3 metrolink_status.py
 ```
 
-On first run, the app creates a config file and tells you an API key is needed. Click "Open Config" in the menu bar dropdown, paste your key, save, and relaunch.
+On first run, a config file is created at `~/.config/metrolink_status/config.json`. Click "Open Config" in the dropdown, add your API key, save, and relaunch.
 
 ## Config
 
@@ -53,7 +56,7 @@ On first run, the app creates a config file and tells you an API key is needed. 
     "morning": {"start": "05:00", "end": "10:30", "show_station": 0},
     "evening": {"start": "14:00", "end": "20:30", "show_station": 1}
   },
-  "skip_days": [4],
+  "skip_days": [4, 5, 6],
   "always_active": false,
   "menu_bar_station": 0,
   "menu_bar_format": "compact",
@@ -62,49 +65,61 @@ On first run, the app creates a config file and tells you an API key is needed. 
 }
 ```
 
-### Key settings
+### Settings
 
 | Field | Description |
 |-------|-------------|
-| `api_key` | Your Metrolink GTFS-RT API key |
-| `stations[].stop_id` | Numeric stop ID from Metrolink GTFS (see table below) |
-| `stations[].routes` | Filter to these route names, or `[]` for all |
-| `poll_interval_seconds` | How often to poll the feed (default 120, minimum 30) |
+| `api_key` | Metrolink GTFS-RT API key |
+| `stations[].stop_id` | Numeric stop ID (see table below) |
+| `stations[].routes` | Filter to specific lines, or `[]` for all |
+| `poll_interval_seconds` | Feed poll interval (default 120) |
 | `active_hours.*.show_station` | Auto-switch menu bar to this station index during this window |
-| `skip_days` | Days to skip polling. `0`=Mon, `4`=Fri, `5`=Sat, `6`=Sun |
-| `always_active` | Set `true` to poll all day, every day |
-| `menu_bar_format` | `"compact"` = `12m`, `"full"` = `AV227 12m` |
+| `skip_days` | Days to skip. `0`=Mon, `4`=Fri, `5`=Sat, `6`=Sun |
+| `always_active` | `true` to poll all day, every day |
+| `menu_bar_format` | `"compact"` = `19m` / `"full"` = `91 700 19m` |
 
-### Menu bar format
+### Menu bar states
 
-| State | Compact | Full |
-|-------|---------|------|
-| On time | `12m` | `AV227 12m` |
-| Minor delay | `12m *` | `AV227 12m *` |
-| Moderate | `12m **` | `AV227 12m **` |
-| Severe | `12m ***` | `AV227 12m ***` |
-| No data | `--` | `--` |
-| Paused | `\|\|` | `\|\|` |
+| State | Display |
+|-------|---------|
+| On time | `19m` |
+| Delayed | `19m **` |
+| No departures | `--` |
+| Paused | `\|\|` |
+| Loading | `...` |
 
-### Dropdown status indicators
+### Dropdown
+
+Each station shows up to 3 trains, departures first:
+
+```
+• 91 700  7:33a (19m)  → Perris - South
+• AV 203  7:39a (25m)  → Vista Canyon
+• AV 202  7:13a (now)  ← Sun Valley
+```
+
+`→` = departing (heading to that destination)
+`←` = arriving (coming from that origin)
+
+### Status indicators
 
 | Symbol | Meaning |
 |--------|---------|
 | `•` | On time |
 | `‣` | Minor delay (<5 min) |
-| `▸` | Moderate delay (5-10 min) |
-| `◆` | Severe delay (10+ min) |
+| `▸` | Moderate (5–10 min) |
+| `◆` | Severe (10+ min) |
 
-### Route names (for config)
+### Route names
 
-| Route | `route_id` value |
-|-------|-----------------|
+| Route | Config value |
+|-------|-------------|
 | Antelope Valley | `Antelope Valley Line` |
 | Ventura County | `Ventura County Line` |
 | San Bernardino | `San Bernardino Line` |
 | Riverside | `Riverside Line` |
 | Orange County | `Orange County Line` |
-| Inland Empire-OC | `Inland Emp.-Orange Co. Line` |
+| Inland Empire–OC | `Inland Emp.-Orange Co. Line` |
 | 91/Perris Valley | `91 Line` |
 | Arrow | `Arrow` |
 
@@ -146,10 +161,12 @@ On first run, the app creates a config file and tells you an API key is needed. 
 
 ## Run at login
 
-### LaunchAgent (recommended)
+From the repo directory:
 
 ```bash
-cat > ~/Library/LaunchAgents/com.metrolink-status.plist << 'EOF'
+cd /path/to/metrolink-status
+
+cat > ~/Library/LaunchAgents/com.metrolink-status.plist << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -159,8 +176,8 @@ cat > ~/Library/LaunchAgents/com.metrolink-status.plist << 'EOF'
     <string>com.metrolink-status</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/python3</string>
-        <string>SCRIPT_PATH/metrolink_status.py</string>
+        <string>$(which python3)</string>
+        <string>$(pwd)/metrolink_status.py</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -177,19 +194,21 @@ cat > ~/Library/LaunchAgents/com.metrolink-status.plist << 'EOF'
 </plist>
 EOF
 
-# Fix the path to where you put the script
-sed -i '' "s|SCRIPT_PATH|$(pwd)|g" ~/Library/LaunchAgents/com.metrolink-status.plist
+launchctl load ~/Library/LaunchAgents/com.metrolink-status.plist
+```
 
+To restart after changes:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.metrolink-status.plist
 launchctl load ~/Library/LaunchAgents/com.metrolink-status.plist
 ```
 
 ## Data sources
 
-- **Trip updates:** Metrolink GTFS-RT protobuf feed (requires free API key)
-- **Service alerts:** Metrolink public alerts feed (no key required)
-- **Stop/route mapping:** Metrolink static GTFS data (bundled in the app)
-
-Feed documentation: [metrolinktrains.com/about/gtfs](https://metrolinktrains.com/about/gtfs/)
+- **Trip updates:** [Metrolink GTFS-RT protobuf feed](https://metrolinktrains.com/about/gtfs/) (free API key required)
+- **Service alerts:** Metrolink public alerts feed (no key needed)
+- **Stop/route mapping:** [Metrolink static GTFS](https://metrolinktrains.com/globalassets/about/gtfs/gtfs.zip) (embedded in the app)
 
 ## Logs
 
@@ -199,11 +218,11 @@ Feed documentation: [metrolinktrains.com/about/gtfs](https://metrolinktrains.com
 
 **"ML: no key" in menu bar** — Open config, add your API key, relaunch.
 
-**"No upcoming departures"** — Normal outside service hours. Try "Refresh Now" during commute times. Check the log for API errors.
+**No trains showing** — Normal outside service hours. Hit "Refresh Now" during commute times. Check the log for API errors.
 
-**Wrong trains showing** — Adjust `routes` in your station config to filter to specific lines.
+**Wrong trains** — Adjust `routes` in your station config to filter to specific lines.
 
-**Feed errors** — Verify your key works: `curl -s -H "X-Api-Key: YOUR_KEY" https://metrolink-gtfsrt.gbsdigital.us/feed/gtfsrt-trips -o test.pb && wc -c test.pb`
+**Verify your key:** `curl -s -H "X-Api-Key: YOUR_KEY" https://metrolink-gtfsrt.gbsdigital.us/feed/gtfsrt-trips -o test.pb && wc -c test.pb` — should return several KB.
 
 ## License
 
